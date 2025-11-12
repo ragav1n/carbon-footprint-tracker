@@ -4,3 +4,4 @@ python-dateutil
 pandas
 sqlalchemy
 pymssql
+streamlit
