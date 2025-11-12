@@ -2,11 +2,11 @@ name: Deploy Streamlit to Azure Web App
 
 on:
   push:
-    branches: [ main ]   # <-- change if your default branch is different
+    branches: [ main ]   # change if your default branch is different
   workflow_dispatch:
 
 env:
-  AZURE_WEBAPP_NAME: carbon-footprint-tracker   # <-- CHANGE to your App Service name
+  AZURE_WEBAPP_NAME: carbon-footprint-tracker   # your App Service name
   PYTHON_VERSION: '3.12'
 
 jobs:
@@ -27,15 +27,17 @@ jobs:
           pip install -r requirements.txt
 
       - name: Sanity import
-        run: python - <<'PY'
-from importlib import import_module
-for m in ["streamlit","pandas","pymssql","sqlalchemy","pdfplumber"]:
-    import_module(m)
-print("Imports OK")
-PY
+        run: |
+          python - <<'PY'
+          from importlib import import_module
+          for m in ["streamlit","pandas","pymssql","sqlalchemy","pdfplumber"]:
+              import_module(m)
+          print("Imports OK")
+          PY
 
       - name: Zip app
-        run: zip -r app.zip . -x ".git/*"
+        run: |
+          zip -r app.zip . -x ".git/*"
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
