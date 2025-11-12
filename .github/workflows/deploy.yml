@@ -2,24 +2,21 @@ name: Deploy Streamlit to Azure Web App
 
 on:
   push:
-    branches: [ main ]   # change if your branch is different
+    branches: [ main ]
   workflow_dispatch:
 
 env:
-  AZURE_WEBAPP_NAME: carbon-footprint-tracker-d6hcdwdhaqaqe6hd   # exact App Service name
+  AZURE_WEBAPP_NAME: carbon-footprint-tracker-d6hcdwdhaqaqe6hd
   AZURE_WEBAPP_HOSTNAME: carbon-footprint-tracker-d6hcdwdhaqaqe6hd.southindia-01.azurewebsites.net
   PYTHON_VERSION: '3.12'
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -29,8 +26,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Zip app
-        run: |
-          zip -r app.zip . -x ".git/*"
+        run: zip -r app.zip . -x ".git/*"
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
