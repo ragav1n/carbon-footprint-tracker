@@ -1,61 +1,27 @@
-name: Deploy Streamlit to Azure Web App
+name: Deploy to Azure Web App (simple)
 
 on:
   push:
-    branches: [ main ]   # change if your default branch is different
+    branches: [ main ]     # change if your default branch is different
   workflow_dispatch:
 
 env:
-  # Exact resource name from Azure Portal
   AZURE_WEBAPP_NAME: carbon-footprint-tracker-d6hcdwdhaqaqe6hd
-  # Full public hostname (used only for health check)
-  AZURE_WEBAPP_HOSTNAME: carbon-footprint-tracker-d6hcdwdhaqaqe6hd.southindia-01.azurewebsites.net
-  PYTHON_VERSION: '3.12'
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
+      # Zip everything in the repo (server will build from requirements.txt)
       - name: Zip app
-        run: |
-          zip -r app.zip . -x ".git/*"
+        run: zip -r app.zip . -x ".git/*"
 
-      - name: Deploy to Azure Web App
+      - name: Deploy
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
           package: app.zip
-          # DO NOT set slot-name here. Leave it out.
-
-      - name: Health check (retry)
-        run: |
-          URL="https://${{ env.AZURE_WEBAPP_HOSTNAME }}/"
-          echo "Probing $URL ..."
-          for i in {1..20}; do
-            if curl -sf "$URL" >/dev/null; then
-              echo "✅ App is responding"
-              exit 0
-            fi
-            echo "Attempt $i failed; waiting 10s..."
-            sleep 10
-          done
-          echo "Health check failed"
-          exit 1
-
-
 
