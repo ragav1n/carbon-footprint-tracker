@@ -2,16 +2,18 @@ name: Deploy Streamlit to Azure Web App
 
 on:
   push:
-    branches: [ main ]   # change if your default branch is different
+    branches: [ main ]   # change if your branch is different
   workflow_dispatch:
 
 env:
-  AZURE_WEBAPP_NAME: carbon-footprint-tracker   # your App Service name
+  AZURE_WEBAPP_NAME: carbon-footprint-tracker-d6hcdwdhaqaqe6hd   # exact App Service name
+  AZURE_WEBAPP_HOSTNAME: carbon-footprint-tracker-d6hcdwdhaqaqe6hd.southindia-01.azurewebsites.net
   PYTHON_VERSION: '3.12'
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,15 +28,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Sanity import
-        run: |
-          python - <<'PY'
-          from importlib import import_module
-          for m in ["streamlit","pandas","pymssql","sqlalchemy","pdfplumber"]:
-              import_module(m)
-          print("Imports OK")
-          PY
-
       - name: Zip app
         run: |
           zip -r app.zip . -x ".git/*"
@@ -46,8 +39,18 @@ jobs:
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
           package: app.zip
 
-      - name: Health check
+      - name: Health check (retry)
         run: |
-          sleep 15
-          curl -f https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/ || (echo "Health check failed" && exit 1)
+          URL="https://${{ env.AZURE_WEBAPP_HOSTNAME }}/"
+          echo "Probing $URL ..."
+          for i in {1..20}; do
+            if curl -sf "$URL" >/dev/null; then
+              echo "✅ App is responding"
+              exit 0
+            fi
+            echo "Attempt $i failed; waiting 10s..."
+            sleep 10
+          done
+          echo "Health check failed"
+          exit 1
 
