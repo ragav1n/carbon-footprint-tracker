@@ -1,0 +1,6 @@
+azure-storage-blob
+pdfplumber
+python-dateutil
+pandas
+sqlalchemy
+pymssql

@@ -1,0 +1,4 @@
+category,activity,unit,kg_co2e_per_unit,region,year,source
+transport,car_petrol_km,km,0.192,IN,2024,DEFRA
+electricity,grid_kwh,kwh,0.708,IN,2024,IEA
+waste,landfill_kg,kg,1.9,IN,2024,IPCC

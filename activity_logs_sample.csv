@@ -1,0 +1,4 @@
+user_id,date,category,activity,unit,quantity,source_system,ts_ingested
+u_001,2025-11-10,transport,car_petrol_km,km,18,manual,2025-11-12T10:00:00Z
+u_001,2025-11-10,electricity,grid_kwh,kwh,4,manual,2025-11-12T10:00:00Z
+u_002,2025-11-11,waste,landfill_kg,kg,1.3,manual,2025-11-12T10:05:00Z
