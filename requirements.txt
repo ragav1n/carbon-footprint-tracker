@@ -1,7 +1,9 @@
+streamlit
+pandas
+pymssql
+sqlalchemy
+python-dateutil
 azure-storage-blob
 pdfplumber
-python-dateutil
-pandas
-sqlalchemy
-pymssql
-streamlit
+python-dotenv
+

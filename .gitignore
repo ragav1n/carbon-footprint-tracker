@@ -1,0 +1,102 @@
+# Environment files
+.env
+.env.*  
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+*.egg-info/
+*.egg
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+.share/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+jupyter-*.json
+
+# Logs
+*.log
+logs/
+debug.log
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dll
+*.dylib
+
+# VSCode / JetBrains
+.vscode/
+.idea/
+
+# macOS files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Node (if any JS/TS used)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp/
+.pnp.js
+
+# Streamlit
+.streamlit/secrets.toml
+
+# SQL / Data dumps
+*.sql
+*.bak
+*.db
+*.sqlite
+*.sqlite3
+
+# Azure blobs temp
+azure_temp/
+
+# Cache
+.cache/
+tmp/
+temp/
+
+# Uploaded/Generated files
+*.pdf
+*.csv
+*.xlsx
+*.parquet
+output/
+uploads/
+
+# Security
+*.pem
+*.key
+*.crt
+
+# VSCode local history
+.history/
+

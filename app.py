@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import os, io, re, json, base64, hashlib
 from datetime import date, datetime, timedelta
 
@@ -9,6 +12,7 @@ from sqlalchemy.engine import URL
 from dateutil import parser as dtparser
 
 import pdfplumber
+import requests
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 
 # =========================
@@ -26,6 +30,10 @@ TDS_VER    = os.getenv("TDS_VERSION", "7.4")
 AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
 UPLOADS_CONTAINER = os.getenv("UPLOADS_CONTAINER", "uploads")
 
+# Ollama config (local AI recommendations)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
+
 # Build SQLAlchemy engine (bulk inserts) using pymssql/FreeTDS
 ENGINE_URL = URL.create(
     "mssql+pymssql",
@@ -38,7 +46,7 @@ ENGINE_URL = URL.create(
 )
 engine = sa.create_engine(ENGINE_URL, pool_pre_ping=True)
 
-# Blob client (optional for local if not set)
+# Blob client
 blob_service = None
 if AZURE_STORAGE_CONNECTION_STRING:
     blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
@@ -77,7 +85,6 @@ def bulk_insert_activities(df: pd.DataFrame):
         df["date"] = pd.to_datetime(df["date"]).dt.date
     if "ts_ingested" in df.columns:
         df["ts_ingested"] = pd.to_datetime(df["ts_ingested"])
-    # ensure source_doc_id column exists (nullable)
     if "source_doc_id" not in df.columns:
         df["source_doc_id"] = None
     with engine.begin() as con:
@@ -105,6 +112,29 @@ def ensure_doc_tables():
 
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_docs_user_created')
       CREATE INDEX IX_docs_user_created ON dbo.source_documents(user_id, created_utc DESC);
+
+    IF OBJECT_ID('dbo.ai_recommendations','U') IS NULL
+    CREATE TABLE dbo.ai_recommendations (
+      reco_id              INT IDENTITY(1,1) PRIMARY KEY,
+      user_filter          NVARCHAR(256) NULL,
+      period_start         DATE NOT NULL,
+      period_end           DATE NOT NULL,
+      model                NVARCHAR(64) NOT NULL,
+      summary_text         NVARCHAR(MAX) NULL,
+      recommendation_text  NVARCHAR(MAX) NOT NULL,
+      created_utc          DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+
+    IF OBJECT_ID('dbo.reports','U') IS NULL
+    CREATE TABLE dbo.reports (
+      report_id       INT IDENTITY(1,1) PRIMARY KEY,
+      user_filter     NVARCHAR(256) NULL,
+      period_start    DATE NOT NULL,
+      period_end      DATE NOT NULL,
+      title           NVARCHAR(256) NOT NULL,
+      report_markdown NVARCHAR(MAX) NOT NULL,
+      created_utc     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+    );
     """
     with _conn() as c:
         with c.cursor() as cur:
@@ -147,7 +177,6 @@ def upload_pdf_and_get_sas(user_id: str, filename: str, content: bytes) -> tuple
     blob_client = blob_service.get_blob_client(container=UPLOADS_CONTAINER, blob=blob_path)
     blob_client.upload_blob(content, overwrite=True)
 
-    # account key available when using connection string auth
     account_name = blob_service.account_name
     account_key = blob_service.credential.account_key
     sas = generate_blob_sas(
@@ -167,6 +196,85 @@ def upload_pdf_and_get_sas(user_id: str, filename: str, content: bytes) -> tuple
 DATE_PAT = r'(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2})'
 KWH_PAT  = r'(\d+(?:\.\d+)?)\s*kwh'
 
+LITRE_PAT = r'(\d+(?:\.\d+)?)\s*(l|litre|liter|liters|litres)\b'
+KG_PAT    = r'(\d+(?:\.\d+)?)\s*(kg|kilogram|kilograms)\b'
+
+def parse_fuel_receipt(pdf_bytes: bytes) -> dict:
+    text_all = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            text_all.append(t)
+    txt = "\n".join(text_all).lower()
+
+    fuel_type = None
+    if "diesel" in txt:
+        fuel_type = "diesel"
+    elif "petrol" in txt or "gasoline" in txt:
+        fuel_type = "petrol"
+
+    litres = None
+    for m in re.finditer(LITRE_PAT, txt):
+        try:
+            val = float(m.group(1))
+            litres = max(litres or 0.0, val)
+        except:
+            pass
+
+    dates = []
+    for m in re.finditer(DATE_PAT, txt):
+        try:
+            dates.append(pd.to_datetime(m.group(1), dayfirst=True).date())
+        except:
+            pass
+    doc_date = dates[0] if dates else None
+
+    excerpt = text_all[0][:500] if text_all else ""
+    return {
+        "litres": litres,
+        "fuel_type": fuel_type,
+        "date": doc_date,
+        "text_excerpt": excerpt
+    }
+
+def parse_waste_invoice(pdf_bytes: bytes) -> dict:
+    text_all = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            text_all.append(t)
+    txt = "\n".join(text_all).lower()
+
+    waste_type = "mixed"
+    if "organic" in txt:
+        waste_type = "organic"
+    if "plastic" in txt:
+        waste_type = "plastic"
+
+    kg = None
+    for m in re.finditer(KG_PAT, txt):
+        try:
+            val = float(m.group(1))
+            kg = max(kg or 0.0, val)
+        except:
+            pass
+
+    dates = []
+    for m in re.finditer(DATE_PAT, txt):
+        try:
+            dates.append(pd.to_datetime(m.group(1), dayfirst=True).date())
+        except:
+            pass
+    doc_date = dates[0] if dates else None
+
+    excerpt = text_all[0][:500] if text_all else ""
+    return {
+        "kg": kg,
+        "waste_type": waste_type,
+        "date": doc_date,
+        "text_excerpt": excerpt
+    }
+
 def parse_electricity_bill(pdf_bytes: bytes) -> dict:
     text_all = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -179,7 +287,7 @@ def parse_electricity_bill(pdf_bytes: bytes) -> dict:
     for m in re.finditer(KWH_PAT, txt, re.IGNORECASE):
         try:
             val = float(m.group(1))
-            kwh = max(kwh or 0.0, val)  # pick largest as "total"
+            kwh = max(kwh or 0.0, val)
         except:
             pass
 
@@ -199,6 +307,149 @@ def parse_electricity_bill(pdf_bytes: bytes) -> dict:
 
     excerpt = "\n".join((text_all[0][:500] if text_all else ""))
     return {"kwh": kwh, "period_start": period_start, "period_end": period_end, "text_excerpt": excerpt}
+
+
+def insert_ai_recommendation(user_filter, period_start, period_end, model, summary_text, recommendation_text):
+    q = """
+      INSERT INTO dbo.ai_recommendations
+        (user_filter, period_start, period_end, model, summary_text, recommendation_text)
+      OUTPUT INSERTED.reco_id
+      VALUES
+        (%(user_filter)s, %(period_start)s, %(period_end)s, %(model)s, %(summary_text)s, %(recommendation_text)s)
+    """
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(q, {
+                "user_filter": user_filter,
+                "period_start": period_start,
+                "period_end": period_end,
+                "model": model,
+                "summary_text": summary_text,
+                "recommendation_text": recommendation_text,
+            })
+            row = cur.fetchone()
+        c.commit()
+    return row[0]
+
+
+def insert_report(user_filter, period_start, period_end, title, report_markdown):
+    q = """
+      INSERT INTO dbo.reports
+        (user_filter, period_start, period_end, title, report_markdown)
+      OUTPUT INSERTED.report_id
+      VALUES
+        (%(user_filter)s, %(period_start)s, %(period_end)s, %(title)s, %(report_markdown)s)
+    """
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(q, {
+                "user_filter": user_filter,
+                "period_start": period_start,
+                "period_end": period_end,
+                "title": title,
+                "report_markdown": report_markdown,
+            })
+            row = cur.fetchone()
+        c.commit()
+    return row[0]
+
+
+def get_latest_ai_reco_for_filter(user_filter: str):
+    q = """
+      SELECT TOP 1 reco_id, period_start, period_end, model, summary_text, recommendation_text, created_utc
+      FROM dbo.ai_recommendations
+      WHERE user_filter = %(user_filter)s
+      ORDER BY created_utc DESC
+    """
+    with _conn() as c:
+        df = pd.read_sql(q, c, params={"user_filter": user_filter})
+    if df.empty:
+        return None
+    return df.iloc[0]
+
+
+# =========================
+# Ollama helpers (AI recos)
+# =========================
+def call_ollama_chat(system_prompt: str, user_content: str) -> str:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "stream": False,
+    }
+    url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat"
+    resp = requests.post(url, json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    msg = (data.get("message") or {}).get("content", "").strip()
+    if not msg:
+        raise RuntimeError("Empty response from Ollama.")
+    return msg
+
+def generate_ai_recommendations_ollama(df_window: pd.DataFrame):
+    """
+    Returns (ai_text, summary_text, period_start, period_end)
+    """
+    if df_window.empty:
+        return (
+            "There is no emissions data in this period. Ask the user to add activities or upload bills/receipts first.",
+            "",
+            None,
+            None,
+        )
+
+    df_local = df_window.copy()
+    df_local["date"] = pd.to_datetime(df_local["date"])
+
+    total = df_local["kg_co2e"].sum()
+    by_cat = df_local.groupby("category")["kg_co2e"].sum().sort_values(ascending=False)
+    by_act = (
+        df_local
+        .groupby(["category", "activity"])["kg_co2e"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(10)
+    )
+
+    start = df_local["date"].min().date()
+    end   = df_local["date"].max().date()
+
+    summary_lines = [
+        f"Time window: {start} to {end}",
+        f"Total emissions (kg CO2e): {total:.2f}",
+        "",
+        "Emissions by category (kg CO2e):",
+    ]
+    for cat, val in by_cat.items():
+        summary_lines.append(f"- {cat}: {val:.2f}")
+
+    summary_lines.append("")
+    summary_lines.append("Top activities by emissions:")
+    for (cat, act), val in by_act.items():
+        summary_lines.append(f"- {cat} / {act}: {val:.2f} kg CO2e")
+
+    summary = "\n".join(summary_lines)
+
+    system_prompt = (
+        "You are a sustainability and carbon-footprint coach for individuals and small businesses in India. "
+        "Given recent emissions data, explain in clear, friendly language what the user's footprint looks like, "
+        "where the main hotspots are, and provide 5–8 concrete, practical recommendations to reduce emissions. "
+        "Be specific but realistic (e.g., public transport, LED lighting, avoiding unnecessary trips, efficient appliances). "
+        "Do not mention that you are an AI or that you received a summary text. Just speak directly to the user."
+    )
+
+    user_msg = (
+        "Here is a summary of my recent carbon emissions:\n\n"
+        f"{summary}\n\n"
+        "Based on this, please analyze my situation and give me personalized recommendations to reduce my emissions. "
+        "Group them under short headings (like 'Electricity', 'Transport', 'Waste') and keep the answer under 400 words."
+    )
+
+    ai_text = call_ollama_chat(system_prompt, user_msg)
+    return ai_text, summary, start, end
 
 # =========================
 # UI: load data + sidebar
@@ -230,7 +481,6 @@ with st.sidebar:
     st.text(f"Server: {SQL_SERVER}")
     st.text(f"DB:     {SQL_DB}")
 
-# filter data for dashboard views
 if not df_all.empty:
     start_d, end_d = (date_range if isinstance(date_range, tuple) else (min_d, max_d))
     mask = (
@@ -246,9 +496,11 @@ else:
 # =========================
 # Tabs
 # =========================
-tab_dash, tab_add, tab_upload, tab_reco, tab_pdf, tab_docs = st.tabs(
-    ["📊 Dashboard", "➕ Add Activity", "📤 Upload CSV", "💡 Recommendations", "📑 Upload PDF (Bills)", "📚 Documents"]
+tab_dash, tab_add, tab_upload, tab_reco, tab_pdf, tab_docs, tab_reports = st.tabs(
+    ["📊 Dashboard", "➕ Add Activity", "📤 Upload CSV", "💡 Recommendations", "📑 Upload PDF", "📚 Documents", "📄 Reports"]
 )
+
+
 
 # ---- Dashboard ----
 with tab_dash:
@@ -308,9 +560,14 @@ with tab_add:
             else:
                 try:
                     row = {
-                        "user_id": user_id, "date": date_in, "category": category,
-                        "activity": activity, "unit": unit, "quantity": float(quantity),
-                        "source_system": source_system, "ts_ingested": ts_ingested,
+                        "user_id": user_id,
+                        "date": date_in,
+                        "category": category,
+                        "activity": activity,
+                        "unit": unit,
+                        "quantity": float(quantity),
+                        "source_system": source_system,
+                        "ts_ingested": ts_ingested,
                         "source_doc_id": None
                     }
                     insert_activity(row)
@@ -343,7 +600,8 @@ with tab_upload:
 
 # ---- Recommendations ----
 with tab_reco:
-    st.markdown("Simple rule-based suggestions (upgradeable to Azure ML / Azure OpenAI).")
+    st.markdown("Simple rule-based suggestions and AI-powered recommendations.")
+
     if df.empty:
         st.info("No data to analyze.")
     else:
@@ -356,86 +614,244 @@ with tab_reco:
         st.write("**Last 30 days CO₂e by category (kg):**")
         st.dataframe(cat_tot.reset_index().rename(columns={"kg_co2e":"kg_last_30"}), use_container_width=True)
 
+        # Rule-based quick suggestions
         sug = []
         if "electricity" in cat_tot.index and cat_tot["electricity"] > 5:
             sug.append("Switch to LED lighting, star-rated appliances; consider rooftop solar where feasible.")
         if "transport" in cat_tot.index and cat_tot["transport"] > 5:
-            sug.append("Prefer public transit / carpool / rail; consolidate trips; consider EV/hybrid.")
+            sug.append("Prefer public transit / carpool / rail; consolidate trips; consider EV/hybrid where possible.")
         if "waste" in cat_tot.index and cat_tot["waste"] > 2:
-            sug.append("Increase recycling and composting; audit high-waste items.")
+            sug.append("Increase recycling and composting; audit high-waste items and packaging.")
         if "procurement" in cat_tot.index and cat_tot["procurement"] > 2:
             sug.append("Choose local suppliers, low-packaging SKUs, and recycled materials.")
         if not sug:
-            sug = ["Keep current habits — marginal improvements possible (optimize standby loads, efficient routing)."]
+            sug = ["Keep current habits — focus on small optimizations (phantom loads, efficient routing, avoiding idle equipment)."]
 
-        st.markdown("### Suggested Actions")
+        st.markdown("### Rule-based Suggested Actions")
         for i, s in enumerate(sug, 1):
             st.write(f"{i}. {s}")
-        st.caption("Note: Impact estimates are illustrative; replace with Azure ML / curated factors for accuracy.")
+        st.caption("These are simple heuristics. For smarter, personalized advice, use the AI-powered recommendations below.")
 
-# ---- Upload PDF (Bills) ----
+        st.markdown("---")
+        st.markdown("### ✨ AI-Powered Recommendations (Ollama)")
+        st.caption(f"Using local model: `{OLLAMA_MODEL}` at `{OLLAMA_BASE_URL}`")
+
+        # Encode current user filter as label
+        if sel_users:
+            user_filter_label = ",".join(sel_users)
+        else:
+            user_filter_label = "ALL"
+
+        ai_placeholder = st.empty()
+
+        if st.button("Generate AI recommendations"):
+            with st.spinner("Talking to your local AI coach..."):
+                try:
+                    ai_text, summary_text, period_start, period_end = generate_ai_recommendations_ollama(last30)
+                    ai_placeholder.markdown(ai_text)
+
+                    if period_start and period_end:
+                        reco_id = insert_ai_recommendation(
+                            user_filter=user_filter_label,
+                            period_start=period_start,
+                            period_end=period_end,
+                            model=OLLAMA_MODEL,
+                            summary_text=summary_text,
+                            recommendation_text=ai_text,
+                        )
+                        st.success(f"AI recommendations saved (ID: {reco_id}) ✅")
+                except Exception as e:
+                    ai_placeholder.empty()
+                    st.error(f"AI recommendation failed: {e}")
+                    st.caption(
+                        "Check that Ollama is running (`ollama serve`) and the model is pulled "
+                        "(for example, `ollama pull llama3.2`)."
+                    )
+
+        st.markdown("---")
+        st.markdown("### 📄 Generate & Save Report for this period")
+
+        if st.button("📄 Generate & Save Report"):
+            if last30.empty:
+                st.error("No data in the last 30 days for the current filters.")
+            else:
+                with st.spinner("Generating summary report..."):
+                    try:
+                        # Try to reuse latest AI reco for this filter
+                        latest = get_latest_ai_reco_for_filter(user_filter_label)
+                        if latest is None:
+                            # If none exists, generate now
+                            ai_text, summary_text, period_start, period_end = generate_ai_recommendations_ollama(last30)
+                            latest_reco_id = insert_ai_recommendation(
+                                user_filter=user_filter_label,
+                                period_start=period_start,
+                                period_end=period_end,
+                                model=OLLAMA_MODEL,
+                                summary_text=summary_text,
+                                recommendation_text=ai_text,
+                            )
+                        else:
+                            ai_text = latest["recommendation_text"]
+                            summary_text = latest["summary_text"]
+                            period_start = latest["period_start"]
+                            period_end = latest["period_end"]
+
+                        # KPIs for the report
+                        last30_total = last30["kg_co2e"].sum()
+                        last30_acts = len(last30)
+                        by_cat_30 = last30.groupby("category")["kg_co2e"].sum().sort_values(ascending=False)
+
+                        report_lines = []
+                        report_lines.append("# Carbon Footprint Report")
+                        report_lines.append("")
+                        report_lines.append(f"**Period:** {period_start} to {period_end}")
+                        report_lines.append(f"**Users:** {user_filter_label}")
+                        report_lines.append("")
+                        report_lines.append("## Summary KPIs")
+                        report_lines.append(f"- Total emissions (last 30 days): {last30_total:.2f} kg CO₂e")
+                        report_lines.append(f"- Number of activities: {last30_acts:,}")
+                        report_lines.append("")
+                        report_lines.append("### Emissions by category (last 30 days)")
+                        for cat, val in by_cat_30.items():
+                            report_lines.append(f"- {cat}: {val:.2f} kg CO₂e")
+                        report_lines.append("")
+                        report_lines.append("## AI Recommendations")
+                        report_lines.append("")
+                        report_lines.append(ai_text)
+
+                        report_md = "\n".join(report_lines)
+                        title = f"Carbon footprint report ({period_start} to {period_end})"
+
+                        report_id = insert_report(
+                            user_filter=user_filter_label,
+                            period_start=period_start,
+                            period_end=period_end,
+                            title=title,
+                            report_markdown=report_md,
+                        )
+
+                        st.success(f"Report generated and saved (ID: {report_id}) ✅")
+                        st.markdown(report_md)
+                    except Exception as e:
+                        st.error(f"Report generation failed: {e}")
+
+# ---- Upload PDF (multi-type) ----
 with tab_pdf:
-    st.markdown("### Upload Utility Bill (PDF) → auto-parse kWh → store PDF & insert activity")
-    user_default = (sel_users[0] if sel_users else "u_001")
-    user_id_for_pdf = st.text_input("User ID for this bill", value=user_default)
+    st.markdown("### Upload Document (PDF) → auto-parse → store PDF & insert activity")
 
-    up_pdf = st.file_uploader("Choose a PDF bill", type=["pdf"])
+    user_default = (sel_users[0] if sel_users else "u_001")
+    user_id_for_pdf = st.text_input("User ID for this document", value=user_default)
+
+    doc_type_label = st.selectbox(
+        "Document type",
+        options=["electricity_bill", "fuel_receipt", "waste_invoice"],
+        format_func=lambda x: {
+            "electricity_bill": "Electricity bill",
+            "fuel_receipt": "Fuel receipt",
+            "waste_invoice": "Waste invoice",
+        }[x]
+    )
+
+    up_pdf = st.file_uploader("Choose a PDF", type=["pdf"])
     if up_pdf is not None:
         pdf_bytes = up_pdf.read()
         sha = hashlib.sha256(pdf_bytes).hexdigest()
 
-        with st.expander("Preview first-page text (debug)"):
-            try:
+        # parse depending on type
+        try:
+            if doc_type_label == "electricity_bill":
                 parsed = parse_electricity_bill(pdf_bytes)
-                st.code(parsed["text_excerpt"] or "(no text found)")
-            except Exception as e:
-                parsed = {"kwh": None, "period_start": None, "period_end": None, "text_excerpt": ""}
-                st.warning(f"Parse attempt failed: {e}")
+                quantity_default = float(parsed.get("kwh") or 0.0)
+                q_label = "Total energy (kWh)"
+                date_default = parsed.get("period_end") or pd.Timestamp.utcnow().date()
+                excerpt = parsed.get("text_excerpt", "")
+            elif doc_type_label == "fuel_receipt":
+                parsed = parse_fuel_receipt(pdf_bytes)
+                quantity_default = float(parsed.get("litres") or 0.0)
+                q_label = "Fuel volume (litres)"
+                date_default = parsed.get("date") or pd.Timestamp.utcnow().date()
+                excerpt = parsed.get("text_excerpt", "")
+            else:  # waste_invoice
+                parsed = parse_waste_invoice(pdf_bytes)
+                quantity_default = float(parsed.get("kg") or 0.0)
+                q_label = "Waste mass (kg)"
+                date_default = parsed.get("date") or pd.Timestamp.utcnow().date()
+                excerpt = parsed.get("text_excerpt", "")
+        except Exception as e:
+            parsed = {}
+            quantity_default = 0.0
+            q_label = "Quantity"
+            date_default = pd.Timestamp.utcnow().date()
+            excerpt = ""
+            st.warning(f"Parse attempt failed: {e}")
 
-        st.write("**Parsed fields (you can edit):**")
-        kwh = st.number_input("Total kWh", value=float(parsed["kwh"] or 0.0), min_value=0.0, step=0.1)
-        pstart = st.date_input("Period start", value=parsed["period_start"] or pd.Timestamp.utcnow().date())
-        pend   = st.date_input("Period end",   value=parsed["period_end"]   or pd.Timestamp.utcnow().date())
+        with st.expander("Preview first-page text (debug)"):
+            st.code(excerpt or "(no text found)")
+
+        st.write("**Parsed fields (you can edit if needed):**")
+        quantity = st.number_input(q_label, value=quantity_default, min_value=0.0, step=0.1)
+        doc_date = st.date_input("Document date / end of period", value=date_default)
 
         colA, colB = st.columns(2)
         with colA:
-            if st.button("Store PDF in Blob & Insert Activity"):
+            if st.button("Store PDF & Insert Activity"):
                 try:
                     if not blob_service:
                         raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING not configured on server.")
-                    # 1) upload & SAS
+                    # 1) upload blob and get SAS
                     blob_path, sas_url = upload_pdf_and_get_sas(user_id_for_pdf, up_pdf.name, pdf_bytes)
-                    # 2) doc record
+
+                    # 2) insert source_documents
                     doc_id = insert_source_document(
                         user_id=user_id_for_pdf,
-                        doc_type="electricity_bill",
-                        period_start=pstart,
-                        period_end=pend,
+                        doc_type=doc_type_label,
+                        period_start=None,
+                        period_end=doc_date,
                         storage_url=sas_url,
                         storage_path=blob_path,
                         sha256=sha,
-                        parsed_json={"kwh": kwh, "period_start": str(pstart), "period_end": str(pend)}
+                        parsed_json={
+                            "doc_type": doc_type_label,
+                            "parsed": parsed,
+                            "quantity_used": quantity,
+                            "doc_date": str(doc_date),
+                        }
                     )
-                    # 3) activity linked to doc
+
+                    # 3) map to activity row
+                    if doc_type_label == "electricity_bill":
+                        category = "electricity"
+                        activity = "grid_kwh"
+                        unit = "kwh"
+                    elif doc_type_label == "fuel_receipt":
+                        category = "transport"
+                        fuel_type = parsed.get("fuel_type") or "petrol"
+                        activity = "diesel_litre" if fuel_type == "diesel" else "petrol_litre"
+                        unit = "litre"
+                    else:  # waste_invoice
+                        category = "waste"
+                        activity = "waste_mixed_kg"
+                        unit = "kg"
+
                     row = {
                         "user_id": user_id_for_pdf,
-                        "date": pend,
-                        "category": "electricity",
-                        "activity": "grid_kwh",
-                        "unit": "kwh",
-                        "quantity": float(kwh),
-                        "source_system": "pdf_bill",
+                        "date": doc_date,
+                        "category": category,
+                        "activity": activity,
+                        "unit": unit,
+                        "quantity": float(quantity),
+                        "source_system": "pdf_" + doc_type_label,
                         "ts_ingested": pd.Timestamp.utcnow().isoformat(timespec="seconds"),
                         "source_doc_id": str(doc_id)
                     }
                     insert_activity(row)
                     st.success("PDF stored and activity inserted ✅")
                     load_footprint.clear()
+
                 except Exception as e:
                     st.error(f"Ingestion failed: {e}")
 
         with colB:
-            # inline PDF preview (small docs). Large files: rely on SAS link in Documents tab.
             b64 = base64.b64encode(pdf_bytes).decode()
             st.markdown(
                 f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="420"></iframe>',
@@ -454,4 +870,45 @@ with tab_docs:
     st.dataframe(docs, use_container_width=True, height=420)
     if not docs.empty:
         st.caption("Open a document via the SAS URL (valid ~1 day).")
+
+
+# ---- Reports tab ----
+with tab_reports:
+    st.markdown("### Saved Reports")
+
+    with _conn() as c:
+        reports_df = pd.read_sql("""
+            SELECT TOP 50 report_id, user_filter, period_start, period_end, title, created_utc
+            FROM dbo.reports
+            ORDER BY created_utc DESC
+        """, c)
+
+    if reports_df.empty:
+        st.info("No reports saved yet. Generate one from the Recommendations tab.")
+    else:
+        st.dataframe(reports_df, use_container_width=True, height=300)
+
+        ids = reports_df["report_id"].tolist()
+        labels = [f"{rid} - {t}" for rid, t in zip(reports_df["report_id"], reports_df["title"])]
+        sel = st.selectbox("Select a report to view", options=list(zip(ids, labels)), format_func=lambda x: x[1])
+
+        sel_id = sel[0] if isinstance(sel, tuple) else sel
+
+        with _conn() as c:
+            full = pd.read_sql(
+                "SELECT report_id, title, report_markdown, created_utc FROM dbo.reports WHERE report_id = %(rid)s",
+                c,
+                params={"rid": sel_id},
+            ).iloc[0]
+
+        st.markdown(f"#### {full['title']}")
+        st.caption(f"Created at: {full['created_utc']}")
+        st.markdown(full["report_markdown"])
+
+        st.download_button(
+            "⬇️ Download report (Markdown)",
+            data=full["report_markdown"].encode("utf-8"),
+            file_name=f"carbon_report_{full['report_id']}.md",
+            mime="text/markdown",
+        )
 
