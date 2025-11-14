@@ -33,6 +33,7 @@ UPLOADS_CONTAINER = os.getenv("UPLOADS_CONTAINER", "uploads")
 # Ollama config (local AI recommendations)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
+OLLAMA_ENABLED  = os.getenv("OLLAMA_ENABLED", "true").lower() == "true"
 
 # Build SQLAlchemy engine (bulk inserts) using pymssql/FreeTDS
 ENGINE_URL = URL.create(
@@ -634,7 +635,10 @@ with tab_reco:
 
         st.markdown("---")
         st.markdown("### ✨ AI-Powered Recommendations (Ollama)")
-        st.caption(f"Using local model: `{OLLAMA_MODEL}` at `{OLLAMA_BASE_URL}`")
+        if not OLLAMA_ENABLED:
+            st.info("AI recommendations are available only in the local version of this app.")
+        else:
+            st.caption(f"Using local model: `{OLLAMA_MODEL}` at `{OLLAMA_BASE_URL}`")
 
         # Encode current user filter as label
         if sel_users:

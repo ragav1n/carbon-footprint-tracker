@@ -6,4 +6,5 @@ python-dateutil
 azure-storage-blob
 pdfplumber
 python-dotenv
-
+requests
+numpy
